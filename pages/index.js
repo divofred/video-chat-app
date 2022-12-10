@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import useSocket from '../hooks/useSocket';
 import { io } from 'socket.io-client';
 
+//Public IceServer: https://www.metered.ca/tools/openrelay/
 const IceServer = {
   iceServers: [
     {
@@ -12,40 +12,88 @@ const IceServer = {
   ],
 };
 
+const useSocket = () => {
+  const socket = useRef();
+  useEffect(() => {
+    if (!socket.current) {
+      const socketInitializer = async () => {
+        await fetch('/api/socket').then(() => {
+          console.log('connected');
+        });
+      };
+      try {
+        socketInitializer();
+        socket.current = true;
+      } catch (error) {
+        console.log(error);
+      }
+    }
+  }, []);
+};
+
 export default function App() {
   //Calling the useSocket function
   useSocket();
   const [errorSetting, seterrorSetting] = useState('');
-  const [done, setdone] = useState(false);
-  const [id, setID] = useState();
-  const [roomId, setRoomId] = useState('');
+  const connectionRef = useRef(null); //The peer connection
+  const [id, setID] = useState(); //Your roomID
+  const [roomId, setRoomId] = useState(''); //The roomID
+  const socket = useRef(); //The socket instance
   const myVideoRef = useRef(); //Your video
   const peerVideoRef = useRef(); //The other users video
   const myStreamRef = useRef(); //Our video stream
-  const connectionRef = useRef(null);
-  const socket = useRef();
-  const host = useRef(false);
+  const host = useRef(false); //Host instance
+  const [done, setdone] = useState(false);
 
-  const roomCreate = () => {
-    socket.current.emit('create-room');
-  };
-  const joinRoom = () => {
-    socket.current.emit('join-room', roomId);
-  };
+  useEffect(() => {
+    //Getting our Video and Audio
+    navigator.mediaDevices
+      .getUserMedia({
+        audio: true,
+        video: true,
+      })
+      .then(stream => {
+        myStreamRef.current = stream;
+        //Storing our video
+        myVideoRef.current.srcObject = stream;
+      })
+      .catch(err => {
+        /* handle the error */
+        console.log(err);
+      });
+  }, []);
+  useEffect(() => {
+    socket.current = io();
 
-  // const createRoom = () => {
-  //   host.current = true;
-  // };
-  const newIceCandidate = incomingIce => {
-    console.log('receiving new icecandidate');
-    // We cast the incoming candidate to RTCIceCandidate
-    const candidate = new RTCIceCandidate(incomingIce);
-    connectionRef.current.addIceCandidate(candidate).catch(e => console.log(e));
-  };
-  // const trackEventHandler = event => {
-  //   console.log('track receiving', event);
-  //   peerVideoRef.current.srcObject = event.streams[0];
-  // };
+    //Getting the `roomId` from the server
+    socket.current.on('me', roomId => {
+      //Saving the roomId got from the server
+      setID(roomId);
+    });
+    //Listening for a `full` event from the server
+    socket.current.on('full', () => {
+      seterrorSetting('Room is filled');
+    });
+    //Listening for a `not-existing` event from the server
+    socket.current.on('not-existing', () => {
+      seterrorSetting("Room doesn't exist");
+    });
+    //Setting the host
+    socket.current.on('created', () => (host.current = true));
+    //Starting the video call when we receive a ready event
+    socket.current.on('ready', startCall);
+
+    /* WebRTC */
+
+    //Getting the offer
+    socket.current.on('offer', receiveOfferHandler);
+    //Getting the answer
+    socket.current.on('answer', handleAnswer);
+    //Getting the icecandidate
+    socket.current.on('ice-candidate', newIceCandidate);
+
+    return () => socket.current.disconnect();
+  }, [roomId]);
   const peerConnection = () => {
     // Creating the Peer Connection
     const connection = new RTCPeerConnection(IceServer);
@@ -66,61 +114,51 @@ export default function App() {
     };
     return connection;
   };
-  useEffect(() => {
-    //Getting our Video and Audio
-    navigator.mediaDevices
-      .getUserMedia({
-        audio: true,
-        video: true,
-      })
-      .then(stream => {
-        myStreamRef.current = stream;
-        //Storing our video
-        myVideoRef.current.srcObject = stream;
-      })
-      .catch(err => {
-        /* handle the error */
-        console.log(err);
-      });
-  }, []);
-  useEffect(() => {
-    socket.current = io();
-    // First we join a room
+  const startCall = roomiid => {
+    console.log('call initiated');
 
-    socket.current.on('me', roomId => {
-      setID(roomId);
-    });
-    socket.current.on('full', () => {
-      seterrorSetting('Room is filled');
-    });
-    socket.current.on('created', () => (host.current = true));
-    socket.current.on('not-existing', () => {
-      seterrorSetting("Room doesn't exist");
-    });
-    socket.current.on('ready', startCall);
-
-    //WebRTC
-    socket.current.on('offer', receiveOfferHandler);
-    socket.current.on('answer', handleAnswer);
-    socket.current.on('ice-candidate', newIceCandidate);
-
-    return () => socket.current.disconnect();
-  }, [roomId]);
-  const receiveOfferHandler = (offer, roomiid) => {
-    if (!host.current) {
+    if (host.current) {
+      //Setting the host's peerConnection
       connectionRef.current = peerConnection();
 
       myStreamRef.current.getTracks().forEach(element => {
+        //Storing the stream of the host in the peerConnection
         connectionRef.current.addTrack(element, myStreamRef.current);
       });
+
+      //Creating the offer
+      connectionRef.current
+        .createOffer()
+        .then(offer => {
+          connectionRef.current.setLocalDescription(offer);
+          //Sending the offer to the server
+          socket.current.emit('offer', offer, roomiid);
+        })
+        .catch(error => {
+          console.log(error);
+        });
+    }
+  };
+  const receiveOfferHandler = (offer, roomiid) => {
+    if (!host.current) {
+      //Setting the other user's peerConnection
+      connectionRef.current = peerConnection();
+
+      myStreamRef.current.getTracks().forEach(element => {
+        //Storing the stream of the other user in the peerConnection
+        connectionRef.current.addTrack(element, myStreamRef.current);
+      });
+      //Storing the host's offer that was received.
       connectionRef.current.setRemoteDescription(offer);
 
+      //Create an answer
       connectionRef.current
         .createAnswer()
         .then(answer => {
-          setdone(true);
           connectionRef.current.setLocalDescription(answer);
+          //Sending the answer to the server
           socket.current.emit('answer', answer, roomiid);
+          setdone(true);
         })
         .catch(error => {
           console.log(error);
@@ -129,41 +167,29 @@ export default function App() {
   };
   const handleAnswer = answer => {
     if (host.current) {
-      console.log('receiveing answer');
+      console.log('receiving answer');
       setdone(true);
       connectionRef.current
         .setRemoteDescription(answer)
         .catch(err => console.log(err));
     }
   };
-  const startCall = roomiid => {
-    console.log('call initiated');
-
-    if (host.current) {
-      connectionRef.current = peerConnection();
-
-      myStreamRef.current.getTracks().forEach(element => {
-        connectionRef.current.addTrack(element, myStreamRef.current);
-      });
-
-      connectionRef.current
-        .createOffer()
-        .then(offer => {
-          connectionRef.current.setLocalDescription(offer);
-
-          socket.current.emit('offer', offer, roomiid);
-        })
-        .catch(error => {
-          console.log(error);
-        });
-    }
+  const newIceCandidate = incomingIce => {
+    console.log('receiving new icecandidate');
+    const candidate = new RTCIceCandidate(incomingIce);
+    connectionRef.current
+      .addIceCandidate(candidate)
+      .catch(err => console.log(err));
   };
-  const iceCandidate = event => {
-    console.log('icecandidate');
-    if (event.candidate) {
-      socket.current.emit('ice-candidate', event.candidate, roomId);
-    }
+  const roomCreate = () => {
+    //Signaling the server to create a room
+    socket.current.emit('create-room');
   };
+  const joinRoom = () => {
+    //Signaling the server to join the user to the room
+    socket.current.emit('join-room', roomId);
+  };
+
   return (
     <>
       <div className="container">
